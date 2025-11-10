@@ -1,159 +1,149 @@
-import requests
-from datetime import datetime, timedelta
-from config import YANDEX_DISK_TOKEN, YANDEX_DISK_FOLDER_URL
-from typing import List, Dict, Optional
+import yadisk
+from datetime import datetime
+from config import YANDEX_DISK_TOKEN
+from typing import List, Dict
+import logging
+
+logger = logging.getLogger(__name__)
 
 class YandexDiskManager:
     def __init__(self):
         self.token = YANDEX_DISK_TOKEN
-        self.base_url = "https://cloud-api.yandex.net/v1/disk/resources"
-        self.headers = {"Authorization": f"OAuth {self.token}"}
-    
-    async def get_folder_contents(self, folder_path: str = "") -> Optional[Dict]:
-        """Получает содержимое папки (публичной или приватной)"""
-        try:
-            if folder_path.startswith('http'):  # Публичная папка
-                response = requests.get(
-                    "https://cloud-api.yandex.net/v1/disk/public/resources",
-                    params={"public_key": folder_path}
-                )
-            else:  # Приватная папка
-                response = requests.get(
-                    f"{self.base_url}",
-                    params={"path": folder_path},
-                    headers=self.headers
-                )
-            
-            return response.json() if response.status_code == 200 else None
-        except Exception as e:
-            print(f"Error getting folder contents: {e}")
-            return None
-    
-    async def get_date_folders(self) -> List[Dict]:
-        """Получает список всех папок с датами из корневой папки"""
-        root_data = await self.get_folder_contents(YANDEX_DISK_FOLDER_URL)
-        date_folders = []
+        self.y = yadisk.YaDisk(token=self.token)
         
-        if root_data and "_embedded" in root_data:
-            for item in root_data["_embedded"]["items"]:
-                if item["type"] == "dir" and self._is_date_folder(item["name"]):
-                    date_folders.append({
-                        "name": item["name"],
-                        "path": item["path"],
-                        "date": self._parse_date(item["name"])
-                    })
+        # Проверяем токен при инициализации
+        if not self.y.check_token():
+            raise Exception("❌ Невалидный токен Яндекс.Диска")
         
-        # Сортируем по дате (новые сверху)
-        return sorted(date_folders, key=lambda x: x["date"], reverse=True)
-    
-    async def get_images_from_date_folder(self, date_str: str = None) -> List[Dict]:
-        """
-        Получает все изображения из папки конкретной даты
-        
-        Args:
-            date_str: Дата в формате "DD.MM.YYYY". Если None - берет сегодняшнюю дату
-        """
-        if date_str is None:
-            date_str = datetime.now().strftime("%d.%m.%Y")
-        
-        # Ищем папку с указанной датой
-        date_folders = await self.get_date_folders()
-        target_folder = next((f for f in date_folders if f["name"] == date_str), None)
-        
-        if not target_folder:
-            print(f"Папка с датой {date_str} не найдена")
-            return []
-        
-        # Получаем содержимое папки с датой
-        folder_data = await self.get_folder_contents(target_folder["path"])
-        return await self._extract_images_from_folder(folder_data)
-    
+        logger.info("✅ Яндекс.Диск подключен")
+
     async def get_today_images(self) -> List[Dict]:
         """Получает все изображения из папки сегодняшнего дня"""
         today_str = datetime.now().strftime("%d.%m.%Y")
+        logger.info(f"📅 Ищем сегодняшние изображения: {today_str}")
         return await self.get_images_from_date_folder(today_str)
-    
-    async def get_latest_images(self) -> List[Dict]:
-        """Получает изображения из самой свежей папки (на случай если сегодняшней нет)"""
-        date_folders = await self.get_date_folders()
+
+    async def get_images_from_date_folder(self, date_str: str) -> List[Dict]:
+        """
+        Получает все изображения из папки конкретной даты
+        """
+        logger.info(f"🔍 Ищем папку с датой: '{date_str}'")
         
-        if not date_folders:
-            return []
-        
-        # Берем самую свежую папку
-        latest_folder = date_folders[0]
-        folder_data = await self.get_folder_contents(latest_folder["path"])
-        images = await self._extract_images_from_folder(folder_data)
-        
-        # Добавляем информацию о дате к каждому изображению
-        for img in images:
-            img["date"] = latest_folder["name"]
-        
-        return images
-    
-    async def _extract_images_from_folder(self, folder_data: Dict) -> List[Dict]:
-        """Извлекает изображения из данных папки"""
-        images = []
-        
-        if folder_data and "_embedded" in folder_data:
-            for item in folder_data["_embedded"]["items"]:
-                if (item["type"] == "file" and 
-                    item.get("mime_type", "").startswith("image/")):
-                    
-                    # Убираем расширение для красивого отображения
-                    name = item["name"].rsplit('.', 1)[0]
-                    
-                    images.append({
-                        "name": name,
-                        "full_name": item["name"],
-                        "preview_url": item.get("preview"),
-                        "download_url": await self._get_direct_download_url(item["path"]),
-                        "size": item.get("size", 0)
-                    })
-        
-        return images
-    
-    async def _get_direct_download_url(self, file_path: str) -> str:
-        """Получает прямую ссылку для скачивания файла"""
         try:
-            if file_path.startswith('disk:'):  # Приватный файл
-                response = requests.get(
-                    f"{self.base_url}/download",
-                    params={"path": file_path},
-                    headers=self.headers
-                )
-            else:  # Публичный файл
-                response = requests.get(
-                    f"https://cloud-api.yandex.net/v1/disk/public/resources/download",
-                    params={
-                        "public_key": YANDEX_DISK_FOLDER_URL,
-                        "path": file_path
-                    }
-                )
+            # Ищем папку FoodSchool64 в корне
+            root_items = list(self.y.listdir("/"))
+            food_school_folder = None
             
-            if response.status_code == 200:
-                return response.json()["href"]
+            for item in root_items:
+                if item.type == "dir" and item.name == "FoodSchool64":
+                    food_school_folder = item
+                    break
+            
+            if not food_school_folder:
+                logger.error("❌ Папка FoodSchool64 не найдена")
+                return []
+            
+            # Ищем папку с датой в FoodSchool64
+            food_school_items = list(self.y.listdir(food_school_folder.path))
+            target_folder = None
+            
+            for item in food_school_items:
+                if item.type == "dir" and item.name == date_str:
+                    target_folder = item
+                    break
+            
+            if not target_folder:
+                logger.error(f"❌ Папка с датой '{date_str}' не найдена")
+                return []
+            
+            logger.info(f"✅ Найдена папка: {target_folder.path}")
+            
+            # Получаем все файлы из папки с датой
+            folder_items = list(self.y.listdir(target_folder.path))
+            images = []
+            
+            for item in folder_items:
+                if item.type == "file" and self._is_image_file(item.name):
+                    try:
+                        download_url = self.y.get_download_link(item.path)
+                        
+                        images.append({
+                            "name": item.name.rsplit('.', 1)[0],  # Без расширения
+                            "full_name": item.name,
+                            "download_url": download_url,
+                            "size": item.size,
+                            "date": date_str
+                        })
+                        logger.info(f"✅ Добавлено изображение: {item.name}")
+                    except Exception as e:
+                        logger.error(f"❌ Ошибка получения ссылки для {item.name}: {e}")
+            
+            logger.info(f"📷 Найдено изображений: {len(images)}")
+            return images
+            
         except Exception as e:
-            print(f"Error getting download URL: {e}")
-        
-        return ""
-    
-    def _is_date_folder(self, folder_name: str) -> bool:
-        """Проверяет, является ли имя папки датой в формате DD.MM.YYYY"""
+            logger.error(f"❌ Ошибка получения изображений: {e}")
+            return []
+
+    async def get_latest_images(self) -> List[Dict]:
+        """Получает изображения из самой свежей папки"""
         try:
+            # Ищем папку FoodSchool64
+            root_items = list(self.y.listdir("/"))
+            food_school_folder = None
+            
+            for item in root_items:
+                if item.type == "dir" and item.name == "FoodSchool64":
+                    food_school_folder = item
+                    break
+            
+            if not food_school_folder:
+                return []
+            
+            # Получаем все папки с датами в FoodSchool64
+            food_school_items = list(self.y.listdir(food_school_folder.path))
+            date_folders = []
+            
+            for item in food_school_items:
+                if item.type == "dir" and self._is_date_folder(item.name):
+                    date_folders.append({
+                        "name": item.name,
+                        "path": item.path,
+                        "date": self._parse_date(item.name)
+                    })
+            
+            if not date_folders:
+                return []
+            
+            # Сортируем по дате и берем самую свежую
+            date_folders.sort(key=lambda x: x["date"], reverse=True)
+            latest_folder = date_folders[0]
+            
+            logger.info(f"🆕 Используем самую свежую папку: {latest_folder['name']}")
+            return await self.get_images_from_date_folder(latest_folder["name"])
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения последних изображений: {e}")
+            return []
+
+    def _is_date_folder(self, folder_name: str) -> bool:
+        """Проверяет, является ли имя папки датой"""
+        try:
+            folder_name = folder_name.strip()
             datetime.strptime(folder_name, "%d.%m.%Y")
             return True
         except ValueError:
             return False
-    
+
+    def _is_image_file(self, filename: str) -> bool:
+        """Проверяет, является ли файл изображением"""
+        image_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.jfif'}
+        filename_lower = filename.lower()
+        return any(filename_lower.endswith(ext) for ext in image_extensions)
+
     def _parse_date(self, date_str: str) -> datetime:
         """Парсит строку даты в datetime объект"""
-        return datetime.strptime(date_str, "%d.%m.%Y")
-    
-    async def get_available_dates(self) -> List[str]:
-        """Возвращает список доступных дат (для будущего использования)"""
-        date_folders = await self.get_date_folders()
-        return [folder["name"] for folder in date_folders]
+        return datetime.strptime(date_str.strip(), "%d.%m.%Y")
 
 # Global instance
 yandex_disk = YandexDiskManager()

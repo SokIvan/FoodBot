@@ -1,3 +1,4 @@
+from asyncio.log import logger
 from aiogram import Router, types
 from aiogram.filters import Command
 from functions.yandex_disk import yandex_disk
@@ -22,7 +23,7 @@ async def start_command(message: types.Message):
         date_info = " (сегодня)"
     
     if not images:
-        await message.answer("🍽️ На этой неделе блюда временно недоступны!")
+        await message.answer("🍽️ Блюда временно недоступны!")
         return
     
     # Первое блюдо для превью
@@ -39,7 +40,7 @@ async def start_command(message: types.Message):
             parse_mode="Markdown"
         )
     except Exception as e:
-        # Если не удалось отправить фото
+        logger.error(f"Ошибка отправки фото: {e}")
         await message.answer(
             text=caption,
             reply_markup=keyboard,

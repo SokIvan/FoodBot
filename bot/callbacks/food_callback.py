@@ -10,7 +10,7 @@ async def handle_dish_callback(callback: types.CallbackQuery):
     """Обработчик смены блюд"""
     filename = callback.data.replace('dish:', '')
     
-    # Получаем текущий набор изображений (сегодняшние или последние доступные)
+    # Получаем текущий набор изображений
     images = await yandex_disk.get_today_images() or await yandex_disk.get_latest_images()
     
     if not images:
@@ -25,12 +25,11 @@ async def handle_dish_callback(callback: types.CallbackQuery):
     
     keyboard = await create_dish_keyboard(images, selected_dish["full_name"])
     
-    # Добавляем информацию о дате в caption если есть
+    # Добавляем информацию о дате
     date_info = f" ({selected_dish.get('date', '')})" if selected_dish.get('date') else ""
     caption = f"🍴 **Выберите блюдо**{date_info}"
     
     try:
-        # Пытаемся обновить фото
         await callback.message.edit_media(
             media=InputMediaPhoto(
                 media=selected_dish["download_url"],
@@ -41,7 +40,6 @@ async def handle_dish_callback(callback: types.CallbackQuery):
         )
     except Exception as e:
         try:
-            # Если не удалось обновить фото, обновляем только клавиатуру
             await callback.message.edit_reply_markup(reply_markup=keyboard)
             await callback.message.edit_caption(caption=caption, parse_mode="Markdown")
         except Exception:
