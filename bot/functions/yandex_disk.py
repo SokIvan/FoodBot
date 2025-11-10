@@ -1,5 +1,5 @@
 import yadisk
-from datetime import datetime
+from datetime import datetime, timedelta
 from config import YANDEX_DISK_TOKEN
 from typing import List, Dict
 import logging
@@ -11,81 +11,85 @@ class YandexDiskManager:
         self.token = YANDEX_DISK_TOKEN
         self.y = yadisk.YaDisk(token=self.token)
         
-        # Проверяем токен при инициализации
+        # Кэш для меню
+        self.cache = {}
+        self.cache_timeout = 900  # 15 минут кэша
+        
         if not self.y.check_token():
             raise Exception("❌ Невалидный токен Яндекс.Диска")
-        
-        logger.info("✅ Яндекс.Диск подключен")
 
     async def get_today_images(self) -> List[Dict]:
-        """Получает все изображения из папки сегодняшнего дня"""
+        """Кэшированное получение сегодняшних изображений"""
         today_str = datetime.now().strftime("%d.%m.%Y")
-        logger.info(f"📅 Ищем сегодняшние изображения: {today_str}")
-        return await self.get_images_from_date_folder(today_str)
-
-    async def get_images_from_date_folder(self, date_str: str) -> List[Dict]:
-        """
-        Получает все изображения из папки конкретной даты
-        """
-        logger.info(f"🔍 Ищем папку с датой: '{date_str}'")
+        cache_key = f"today_{today_str}"
         
+        # Проверяем кэш
+        if cache_key in self.cache:
+            cached_data, timestamp = self.cache[cache_key]
+            if datetime.now() - timestamp < timedelta(seconds=self.cache_timeout):
+                logger.info("✅ Используем кэшированное меню")
+                return cached_data
+        
+        # Получаем свежие данные
+        logger.info("🔄 Обновляем меню из Яндекс.Диска")
+        images = await self._get_images_from_date_folder(today_str)
+        self.cache[cache_key] = (images, datetime.now())
+        return images
+
+    async def get_latest_images(self) -> List[Dict]:
+        """Кэшированное получение последних изображений"""
+        cache_key = "latest_images"
+        
+        # Проверяем кэш
+        if cache_key in self.cache:
+            cached_data, timestamp = self.cache[cache_key]
+            if datetime.now() - timestamp < timedelta(seconds=self.cache_timeout):
+                return cached_data
+        
+        # Получаем свежие данные
+        images = await self._get_latest_images_actual()
+        self.cache[cache_key] = (images, datetime.now())
+        return images
+
+    async def _get_images_from_date_folder(self, date_str: str) -> List[Dict]:
+        """Получает изображения из папки с датой (оптимизированно)"""
         try:
-            # Ищем папку FoodSchool64 в корне
-            root_items = list(self.y.listdir("/"))
-            food_school_folder = None
+            # Всего 3 запроса к API независимо от количества фото!
             
-            for item in root_items:
-                if item.type == "dir" and item.name == "FoodSchool64":
-                    food_school_folder = item
-                    break
-            
-            if not food_school_folder:
-                logger.error("❌ Папка FoodSchool64 не найдена")
+            # 1. Проверяем существование папки с датой
+            date_folder_path = f"/FoodSchool64/{date_str}"
+            try:
+                self.y.get_meta(date_folder_path)
+            except yadisk.exceptions.PathNotFoundError:
                 return []
             
-            # Ищем папку с датой в FoodSchool64
-            food_school_items = list(self.y.listdir(food_school_folder.path))
-            target_folder = None
+            # 2. Получаем все файлы из папки
+            folder_items = list(self.y.listdir(date_folder_path))
             
-            for item in food_school_items:
-                if item.type == "dir" and item.name == date_str:
-                    target_folder = item
-                    break
-            
-            if not target_folder:
-                logger.error(f"❌ Папка с датой '{date_str}' не найдена")
-                return []
-            
-            logger.info(f"✅ Найдена папка: {target_folder.path}")
-            
-            # Получаем все файлы из папки с датой
-            folder_items = list(self.y.listdir(target_folder.path))
             images = []
-            
             for item in folder_items:
                 if item.type == "file" and self._is_image_file(item.name):
                     try:
+                        # 3. Получаем ссылку для каждого файла
                         download_url = self.y.get_download_link(item.path)
                         
                         images.append({
-                            "name": item.name.rsplit('.', 1)[0],  # Без расширения
+                            "name": item.name.rsplit('.', 1)[0],
                             "full_name": item.name,
                             "download_url": download_url,
                             "size": item.size,
                             "date": date_str
                         })
-                        logger.info(f"✅ Добавлено изображение: {item.name}")
-                    except Exception as e:
-                        logger.error(f"❌ Ошибка получения ссылки для {item.name}: {e}")
+                    except Exception:
+                        continue
             
-            logger.info(f"📷 Найдено изображений: {len(images)}")
             return images
             
         except Exception as e:
-            logger.error(f"❌ Ошибка получения изображений: {e}")
+            logger.error(f"Ошибка получения изображений: {e}")
             return []
 
-    async def get_latest_images(self) -> List[Dict]:
+    async def _get_latest_images_actual(self) -> List[Dict]:
         """Получает изображения из самой свежей папки"""
         try:
             # Ищем папку FoodSchool64
@@ -100,7 +104,7 @@ class YandexDiskManager:
             if not food_school_folder:
                 return []
             
-            # Получаем все папки с датами в FoodSchool64
+            # Получаем все папки с датами
             food_school_items = list(self.y.listdir(food_school_folder.path))
             date_folders = []
             
@@ -119,11 +123,10 @@ class YandexDiskManager:
             date_folders.sort(key=lambda x: x["date"], reverse=True)
             latest_folder = date_folders[0]
             
-            logger.info(f"🆕 Используем самую свежую папку: {latest_folder['name']}")
-            return await self.get_images_from_date_folder(latest_folder["name"])
+            return await self._get_images_from_date_folder(latest_folder["name"])
             
         except Exception as e:
-            logger.error(f"❌ Ошибка получения последних изображений: {e}")
+            logger.error(f"Ошибка получения последних изображений: {e}")
             return []
 
     def _is_date_folder(self, folder_name: str) -> bool:
@@ -144,6 +147,11 @@ class YandexDiskManager:
     def _parse_date(self, date_str: str) -> datetime:
         """Парсит строку даты в datetime объект"""
         return datetime.strptime(date_str.strip(), "%d.%m.%Y")
+
+    def clear_cache(self):
+        """Очищает кэш (можно вызывать при смене дня)"""
+        self.cache.clear()
+        logger.info("🧹 Кэш очищен")
 
 # Global instance
 yandex_disk = YandexDiskManager()
