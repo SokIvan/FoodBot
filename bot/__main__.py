@@ -6,6 +6,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
+from aiohttp import web
 
 from config import TELEGRAM_TOKEN
 from handlers import start_handler, mark_handler, admin_handler
@@ -15,51 +16,72 @@ from database.db_supabase import supabase_client
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Глобальные переменные для веб-сервера
+bot_instance = None
+dp_instance = None
+
 async def self_ping():
-    """Функция для само-пинга, чтобы бот не засыпал"""
+    """Функция для само-пинга"""
     try:
-        # Можно добавить логирование для отслеживания работы
         logger.info("🔄 Самопинг выполнен - бот активен")
-        
-        # Если у вас есть веб-сервер, можно делать HTTP запрос
-        # Но для простого бота достаточно просто логирования
     except Exception as e:
         logger.error(f"Ошибка при самопинге: {e}")
 
-async def main():
+async def health_check(request):
+    """Простой эндпоинт для health check"""
+    return web.Response(text="Bot is alive!")
+
+async def start_bot():
+    """Запуск бота"""
+    global bot_instance, dp_instance
     
-    bot = Bot(
+    bot_instance = Bot(
         token=TELEGRAM_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)
     )
-    dp = Dispatcher()
+    dp_instance = Dispatcher()
     
     # Настройка планировщика для самопинга
     scheduler = AsyncIOScheduler()
-    
-    # Запускаем самопинг каждые 14 минут
     scheduler.add_job(
         self_ping,
         trigger=IntervalTrigger(minutes=14),
         id='self_ping',
         replace_existing=True
     )
-    
     scheduler.start()
     
-    dp.include_router(start_handler.router)
-    dp.include_router(mark_handler.router)
-    dp.include_router(type_callback.router)
-    dp.include_router(admin_handler.router)
+    dp_instance.include_router(start_handler.router)
+    dp_instance.include_router(mark_handler.router)
+    dp_instance.include_router(type_callback.router)
+    dp_instance.include_router(admin_handler.router)
     
     logger.info("🍽️ FoodBot запущен!")
     logger.info("🔄 Самопинг активирован - интервал 14 минут")
     
-    try:
-        await dp.start_polling(bot)
-    finally:
-        # Корректное завершение работы планировщика
-        scheduler.shutdown()
+    # Запускаем бота в фоне
+    asyncio.create_task(dp_instance.start_polling(bot_instance))
+
+async def on_shutdown(app):
+    """Корректное завершение работы"""
+    if bot_instance:
+        await bot_instance.session.close()
+
+async def create_app():
+    """Создание веб-приложения"""
+    app = web.Application()
+    
+    # Добавляем эндпоинты
+    app.router.add_get('/', health_check)
+    app.router.add_get('/health', health_check)
+    
+    # Запускаем бота при старте приложения
+    app.on_startup.append(lambda app: start_bot())
+    app.on_shutdown.append(on_shutdown)
+    
+    return app
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Запускаем веб-сервер на порте, который предоставляет Render
+    port = int(os.environ.get("PORT", 10000))
+    web.run_app(create_app(), port=port, host='0.0.0.0')
