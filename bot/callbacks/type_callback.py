@@ -2,15 +2,19 @@ from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
-
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from keyboards.type_keyboard import get_rating_keyboard,get_comment_keyboard
 from aiogram import types
 from functions.yandex_disk import yandex_disk
+from database.db_supabase import supabase_client
 import re
 
 import logging
 
 router = Router()
 logger = logging.getLogger(__name__)
+global_user_id = None
+
 
 class MealRating(StatesGroup):
     waiting_for_dish_rating = State()
@@ -19,14 +23,141 @@ class MealRating(StatesGroup):
 
 # Хранилище для временных данных
 user_ratings = {}
+# Защита от множественных нажатий
+processing_ratings = set()
+
+async def cleanup_chat(message: types.Message, state: FSMContext):
+    """Очистка чата - удаляет последние сообщения бота"""
+    data = await state.get_data()
+    last_message_id = data.get('last_message_id')
+    
+    try:
+        # Удаляем последнее сообщение бота (основное сообщение с оценками)
+        if last_message_id:
+            try:
+                await message.bot.delete_message(
+                    chat_id=message.chat.id,
+                    message_id=last_message_id
+                )
+            except Exception as e:
+                logger.warning(f"Не удалось удалить последнее сообщение бота: {e}")
+                
+    except Exception as e:
+        logger.error(f"Ошибка при очистке чата: {e}")
+
+async def edit_or_send_message(message: types.Message, state: FSMContext, 
+                              content: str, photo_url: str = None, 
+                              keyboard = None, parse_mode: str = None):
+    """Универсальная функция для редактирования/отправки сообщения"""
+    data = await state.get_data()
+    last_message_id = data.get('last_message_id')
+    
+    try:
+        if photo_url:
+            # Если есть фото - отправляем/редактируем медиа
+            if last_message_id:
+                await message.bot.edit_message_media(
+                    chat_id=message.chat.id,
+                    message_id=last_message_id,
+                    media=types.InputMediaPhoto(
+                        media=photo_url,
+                        caption=content,
+                        parse_mode=parse_mode
+                    ),
+                    reply_markup=keyboard
+                )
+            else:
+                new_message = await message.answer_photo(
+                    photo=photo_url,
+                    caption=content,
+                    reply_markup=keyboard,
+                    parse_mode=parse_mode
+                )
+                await state.update_data(last_message_id=new_message.message_id)
+        else:
+            # Если нет фото - отправляем/редактируем текст
+            if last_message_id:
+                await message.bot.edit_message_text(
+                    chat_id=message.chat.id,
+                    message_id=last_message_id,
+                    text=content,
+                    reply_markup=keyboard,
+                    parse_mode=parse_mode
+                )
+            else:
+                new_message = await message.answer(
+                    text=content,
+                    reply_markup=keyboard,
+                    parse_mode=parse_mode
+                )
+                await state.update_data(last_message_id=new_message.message_id)
+                
+    except Exception as e:
+        # Если редактирование не удалось, отправляем новое сообщение
+        if photo_url:
+            new_message = await message.answer_photo(
+                photo=photo_url,
+                caption=content,
+                reply_markup=keyboard,
+                parse_mode=parse_mode
+            )
+        else:
+            new_message = await message.answer(
+                text=content,
+                reply_markup=keyboard,
+                parse_mode=parse_mode
+            )
+        await state.update_data(last_message_id=new_message.message_id)
+
+async def remove_photo_from_message(message: types.Message, state: FSMContext, 
+                                   content: str, keyboard = None):
+    """Специальная функция для удаления фото из сообщения (переход к тексту)"""
+    data = await state.get_data()
+    last_message_id = data.get('last_message_id')
+    
+    if not last_message_id:
+        # Если нет предыдущего сообщения, просто отправляем текст
+        new_message = await message.answer(
+            text=content,
+            reply_markup=keyboard
+        )
+        await state.update_data(last_message_id=new_message.message_id)
+        return
+    
+    try:
+        # Пытаемся отредактировать медиа-сообщение в текстовое
+        await message.bot.edit_message_text(
+            chat_id=message.chat.id,
+            message_id=last_message_id,
+            text=content,
+            reply_markup=keyboard
+        )
+    except Exception as e:
+        # Если не получилось (например, нельзя сменить тип контента), 
+        # удаляем старое сообщение и создаем новое
+        try:
+            await message.bot.delete_message(
+                chat_id=message.chat.id,
+                message_id=last_message_id
+            )
+        except:
+            pass
+        
+        new_message = await message.answer(
+            text=content,
+            reply_markup=keyboard
+        )
+        await state.update_data(last_message_id=new_message.message_id)
 
 @router.callback_query(F.data.startswith("type_"))
 async def process_meal_type(callback: CallbackQuery, state: FSMContext):
     """Обработчик выбора типа приема пищи"""
     
-
-    
-    
+    # Проверяем, не занят ли пользователь другой оценкой
+    current_state = await state.get_state()
+    if current_state is not None:
+        await callback.answer("⏳ Вы уже начали оценку меню. Завершите текущую оценку прежде чем начинать новую.", show_alert=True)
+        return
     
     meal_type_map = {
         "type_zavtrak": "завтрак",
@@ -54,11 +185,11 @@ async def process_meal_type(callback: CallbackQuery, state: FSMContext):
         meal_type=meal_type,
         images=images,
         current_image_index=0,
-        dish_ratings=[],
-        invalid_input_count=0,
-        last_message_id=callback.message.message_id  # Сохраняем ID сообщения для редактирования
+        dish_ratings=[],  # Теперь это будет список словарей
+        last_message_id=callback.message.message_id
     )
-    # Показываем первую фотку (редактируем исходное сообщение)
+    
+    # Показываем первую фотку с кнопками оценок
     await show_next_image(callback.message, state)
     
     # Переходим в состояние ожидания оценки блюда
@@ -66,11 +197,10 @@ async def process_meal_type(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 async def show_next_image(message: types.Message, state: FSMContext):
-    """Показывает следующее изображение и просит оценку (редактирует сообщение)"""
+    """Показывает следующее изображение с кнопками оценок"""
     data = await state.get_data()
     images = data['images']
     current_index = data['current_image_index']
-    last_message_id = data.get('last_message_id', message.message_id)
     
     if current_index >= len(images):
         # Все фото закончились, переходим к оценке меню
@@ -79,219 +209,260 @@ async def show_next_image(message: types.Message, state: FSMContext):
     
     current_image = images[current_index]
     
-    try:
-        # Редактируем сообщение с новой фоткой
-        await message.bot.edit_message_media(
-            chat_id=message.chat.id,
-            message_id=last_message_id,
-            media=types.InputMediaPhoto(
-                media=current_image['download_url'],
-                caption=f"📸 Блюдо {current_index + 1} из {len(images)}\n"
-                        f"📝 Введите оценку от 1 до 10:"
-            )
-        )
-    except Exception as e:
-        # Если не удалось отредактировать (например, фото не меняется), отправляем новое
-        new_message = await message.answer_photo(
-            photo=current_image['download_url'],
-            caption=f"📸 Блюдо {current_index + 1} из {len(images)}\n"
-                    f"📝 Введите оценку от 1 до 10:"
-        )
-        await state.update_data(last_message_id=new_message.message_id)
+    caption = (f"📸 Блюдо {current_image['name']} {current_index + 1} из {len(images)}\n"
+               f"📝 Оцените блюдо:")
+    
+    await edit_or_send_message(
+        message=message,
+        state=state,
+        content=caption,
+        photo_url=current_image['download_url'],
+        keyboard=get_rating_keyboard()
+    )
 
 async def ask_menu_rating(message: types.Message, state: FSMContext):
-    """Запрашивает общую оценку меню (редактирует сообщение)"""
+    """Запрашивает общую оценку меню"""
     data = await state.get_data()
     dish_ratings = data['dish_ratings']
-    last_message_id = data.get('last_message_id', message.message_id)
     
     # Считаем среднюю оценку блюд
-    avg_rating = sum(dish_ratings) / len(dish_ratings) if dish_ratings else 0
+    if dish_ratings:
+        avg_rating = sum(dish['mark'] for dish in dish_ratings) / len(dish_ratings)
+    else:
+        avg_rating = 0
     
-    try:
-        # Редактируем сообщение для запроса оценки меню
-        # Вместо edit_message_caption используем edit_message_text
-        await message.bot.edit_message_text(
-            chat_id=message.chat.id,
-            message_id=last_message_id,
-            text=f"🍽 Вы оценили {len(dish_ratings)} блюд(а)\n"
-                f"📊 Средняя оценка блюд: {avg_rating:.1f}\n\n"
-                f"📝 Теперь оцените меню в целом от 1 до 10:"
-        )
-    except Exception as e:
-        # Если не удалось отредактировать, отправляем новое сообщение
-        new_message = await message.answer(
-            f"🍽 Вы оценили {len(dish_ratings)} блюд(а)\n"
-            f"📊 Средняя оценка блюд: {avg_rating:.1f}\n\n"
-            f"📝 Теперь оцените меню в целом от 1 до 10:"
-        )
-        await state.update_data(last_message_id=new_message.message_id)
+    caption = (f"🍽 Вы оценили {len(dish_ratings)} блюд(а)\n"
+              f"📊 Средняя оценка блюд: {avg_rating:.1f}\n\n"
+              f"📝 Теперь оцените меню в целом:")
+    
+    # Используем специальную функцию для удаления фото
+    await remove_photo_from_message(
+        message=message,
+        state=state,
+        content=caption,
+        keyboard=get_rating_keyboard()
+    )
     
     await state.set_state(MealRating.waiting_for_menu_rating)
 
-@router.message(MealRating.waiting_for_dish_rating)
-async def process_dish_rating(message: Message, state: FSMContext):
-    """Обработка оценки блюда"""
-    data = await state.get_data()
-    invalid_input_count = data.get('invalid_input_count', 0)
-    last_message_id = data.get('last_message_id')
-    images = data['images']
-    current_index = data['current_image_index']
+@router.callback_query(F.data.startswith("rating_"))
+async def process_rating(callback: CallbackQuery, state: FSMContext):
+    """Обработка оценки через кнопки"""
+    current_state = await state.get_state()
     
-    # Удаляем сообщение с оценкой пользователя
-    await message.delete()
-    
-    # Проверяем валидность ввода
-    if not re.match(r'^([1-9]|10)$', message.text.strip()):
-        invalid_input_count += 1
-        
-        if invalid_input_count >= 3:
-            await message.bot.edit_message_caption(
-                chat_id=message.chat.id,
-                message_id=last_message_id,
-                caption="❌ Слишком много неверных попыток. Оценка отменена."
-            )
-            await state.clear()
-            return
-        
-        await state.update_data(invalid_input_count=invalid_input_count)
-        
-        # Обновляем текущее фото с сообщением об ошибке
-        try:
-            current_image = images[current_index]
-            await message.bot.edit_message_caption(
-                chat_id=message.chat.id,
-                message_id=last_message_id,
-                caption=f"❌ Неверный формат оценки!\n"
-                       f"📸 Блюдо {current_index + 1} из {len(images)}\n"
-                       f"📝 Введите оценку от 1 до 10 (попытка {invalid_input_count + 1}/3):"
-            )
-        except Exception as e:
-            # Если редактирование не удалось, создаем новое сообщение
-            new_message = await message.answer(
-                f"❌ Неверный формат оценки!\n"
-                f"📸 Блюдо {current_index + 1} из {len(images)}\n"
-                f"📝 Введите оценку от 1 до 10 (попытка {invalid_input_count + 1}/3):"
-            )
-            await state.update_data(last_message_id=new_message.message_id)
+    if not current_state:
+        await callback.answer("Сессия завершена")
         return
     
-    # Валидная оценка
-    rating = int(message.text.strip())
+    # Защита от множественных нажатий
+    global global_user_id
+    global_user_id = callback.from_user.id
+    user_id = callback.from_user.id
+    rating_key = f"{user_id}_{current_state}"
     
-    # Сохраняем оценку
-    dish_ratings = data['dish_ratings']
-    dish_ratings.append(rating)
-    
-    # Сбрасываем счетчик невалидных вводов и переходим к следующему изображению
-    await state.update_data(
-        dish_ratings=dish_ratings,
-        invalid_input_count=0,
-        current_image_index=current_index + 1
-    )
-    
-    # Показываем следующее изображение
-    await show_next_image(message, state)
-
-@router.message(MealRating.waiting_for_menu_rating)
-async def process_menu_rating(message: Message, state: FSMContext):
-    """Обработка общей оценки меню"""
-    data = await state.get_data()
-    last_message_id = data.get('last_message_id')
-    
-    # Удаляем сообщение с оценкой пользователя
-    await message.delete()
-    
-    # Проверяем валидность ввода
-    if not re.match(r'^([1-9]|10)$', message.text.strip()):
-        try:
-            await message.bot.edit_message_caption(
-                chat_id=message.chat.id,
-                message_id=last_message_id,
-                caption="❌ Неверный формат оценки! Введите число от 1 до 10:"
-            )
-        except Exception as e:
-            new_message = await message.answer("❌ Неверный формат оценки! Введите число от 1 до 10:")
-            await state.update_data(last_message_id=new_message.message_id)
+    if rating_key in processing_ratings:
+        await callback.answer("⏳ Обрабатывается предыдущая оценка...")
         return
     
-    menu_rating = int(message.text.strip())
+    processing_ratings.add(rating_key)
     
-    # Сохраняем оценку меню
-    await state.update_data(menu_rating=menu_rating)
-    
-    # Запрашиваем комментарий (редактируем сообщение)
     try:
-        await message.bot.edit_message_caption(
-            chat_id=message.chat.id,
-            message_id=last_message_id,
-            caption="💬 Отлично! Теперь напишите ваш комментарий к меню "
-                   "(или отправьте '-' если не хотите оставлять комментарий):"
-        )
-    except Exception as e:
-        new_message = await message.answer(
-            "💬 Отлично! Теперь напишите ваш комментарий к меню "
-            "(или отправьте '-' если не хотите оставлять комментарий):"
-        )
-        await state.update_data(last_message_id=new_message.message_id)
+        rating = int(callback.data.split("_")[1])
+    except (ValueError, IndexError):
+        processing_ratings.discard(rating_key)
+        await callback.answer("Ошибка обработки оценки")
+        return
     
-    await state.set_state(MealRating.waiting_for_comment)
+    # НЕ удаляем сообщение, только отвечаем на callback
+    await callback.answer(f"Оценка {rating} принята!")
+    
+    try:
+        if current_state == MealRating.waiting_for_dish_rating.state:
+            # Оценка блюда
+            data = await state.get_data()
+            images = data['images']
+            current_index = data['current_image_index']
+            
+            # Проверяем, что текущий индекс в пределах допустимого
+            if current_index >= len(images):
+                logger.warning(f"Текущий индекс {current_index} превышает количество изображений {len(images)}")
+                return
+            
+            current_image = images[current_index]
+            dish_ratings = data['dish_ratings']
+            
+            # Добавляем оценку в виде словаря
+            dish_rating = {
+                "name": current_image['name'],
+                "mark": rating
+            }
+            dish_ratings.append(dish_rating)
+            
+            await state.update_data(
+                dish_ratings=dish_ratings,
+                current_image_index=current_index + 1
+            )
+            
+            # Показываем следующее изображение
+            await show_next_image(callback.message, state)
+            
+        elif current_state == MealRating.waiting_for_menu_rating.state:
+            # Оценка меню
+            await state.update_data(menu_rating=rating)
+            
+            # Запрашиваем комментарий
+            caption = ("💬 Отлично! Теперь напишите ваш комментарий к меню\n"
+                      "Или нажмите кнопку ниже чтобы пропустить:")
+            
+            await edit_or_send_message(
+                message=callback.message,
+                state=state,
+                content=caption,
+                keyboard=get_comment_keyboard()
+            )
+            
+            await state.set_state(MealRating.waiting_for_comment)
+    
+    except Exception as e:
+        logger.error(f"Ошибка при обработке оценки: {e}")
+        await callback.answer("❌ Произошла ошибка при обработке оценки")
+    
+    finally:
+        # Всегда снимаем блокировку
+        processing_ratings.discard(rating_key)
+
+@router.callback_query(F.data == "no_comment")
+async def process_no_comment(callback: CallbackQuery, state: FSMContext):
+    """Обработка кнопки 'Без комментариев'"""
+    # Защита от множественных нажатий
+    global global_user_id
+    global_user_id = callback.from_user.id
+    user_id = callback.from_user.id
+    rating_key = f"{user_id}_no_comment"
+    
+    if rating_key in processing_ratings:
+        await callback.answer("⏳ Обрабатывается...")
+        return
+    
+    processing_ratings.add(rating_key)
+    
+    try:
+        # НЕ удаляем сообщение, только отвечаем
+        await callback.answer("Пропущено")
+        await process_final_results(callback.message, state, comment=None)
+    finally:
+        processing_ratings.discard(rating_key)
 
 @router.message(MealRating.waiting_for_comment)
-async def process_comment(message: Message, state: FSMContext):
-    """Обработка комментария"""
+async def process_comment_input(message: Message, state: FSMContext):
+    """Обработка текстового комментария"""
     comment = message.text.strip()
+    global global_user_id
+    global_user_id = message.from_user.id 
+    # Удаляем только сообщение с комментарием пользователя
+    await message.delete()
+    
+    # Обрабатываем финальные результаты
+    await process_final_results(message, state, comment)
+
+async def process_final_results(message: types.Message, state: FSMContext, comment: str = None):
+    """Обработка и вывод финальных результатов"""
     data = await state.get_data()
-    last_message_id = data.get('last_message_id')
     
     # Получаем все данные
     meal_type = data['meal_type']
     dish_ratings = data['dish_ratings']
-    menu_rating = data['menu_rating']
+    menu_rating = data.get('menu_rating', 0)
     
-    # Сохраняем результаты
-    user_id = message.from_user.id
+    # === ДОБАВЛЯЕМ РАБОТУ С БАЗОЙ ДАННЫХ ===
+    
+    user_id = global_user_id
+    user = await message.bot.get_chat(user_id)
+    user_fname = user.first_name
+    user_lname = user.last_name
+    user_username = user.username
+    current_date = message.date.date().isoformat()
+    
+    # Безопасный комментарий для food_menu (если None - пустая строка)
+    safe_comment = comment if comment and comment != '-' else ""
+    
+    try:
+        # 1. Проверяем и добавляем пользователя если нет
+        if not await supabase_client.user_exists(user_id):
+            user_data = {
+                "id": user_id,
+                "Username": user_username or f"user_{user_id}",
+                "Name": f"{user_fname or ''} {user_lname or ''}".strip()
+            }
+            await supabase_client.set_user(user_data)
+            logger.info(f"Добавлен новый пользователь: {user_id}")
+        
+        # 2. Сохраняем оценки блюд в таблицу food (БЕЗ КОММЕНТАРИЯ)
+        for dish in dish_ratings:
+            food_data = {
+                "date": current_date,
+                "name": dish['name'],
+                "mark": dish['mark'],
+                "user_id": user_id
+                # НЕТ КОЛОНКИ comment - убрали из таблицы food
+            }
+            await supabase_client.add_food_review(food_data)
+        
+        # 3. Сохраняем оценку меню в таблицу food_menu (С КОММЕНТАРИЕМ)
+        menu_data = {
+            "date": current_date,
+            "type": meal_type,
+            "name": f"Меню {meal_type}",
+            "mark": menu_rating,
+            "comment": safe_comment,  # комментарий остался в food_menu
+            "user_id": user_id
+        }
+        await supabase_client.add_food_menu_review(menu_data)
+        
+        logger.info(f"Данные успешно сохранены в БД для пользователя {user_id}")
+        
+    except Exception as e:
+        logger.error(f"Ошибка при сохранении в БД: {e}")
+    # === КОНЕЦ РАБОТЫ С БАЗОЙ ДАННЫХ ===
+    
+    # Сохраняем результаты в локальное хранилище (для обратной совместимости)
     user_ratings[user_id] = {
         'meal_type': meal_type,
         'dish_ratings': dish_ratings,
         'menu_rating': menu_rating,
-        'comment': comment if comment != '-' else None,
+        'comment': comment if comment and comment != '-' else None,
         'timestamp': message.date.isoformat()
     }
     
     # Формируем итоговое сообщение
-    avg_dish_rating = sum(dish_ratings) / len(dish_ratings) if dish_ratings else 0
+    if dish_ratings:
+        avg_dish_rating = sum(dish['mark'] for dish in dish_ratings) / len(dish_ratings)
+        dishes_details = "\n".join([f"  • {dish['name']}: {dish['mark']}/5" for dish in dish_ratings])
+    else:
+        avg_dish_rating = 0
+        dishes_details = "  • Нет оценок"
     
     result_text = (
         f"✅ Спасибо за вашу оценку!\n\n"
         f"🍽 Тип меню: {meal_type.capitalize()}\n"
-        f"📊 Оценка блюд: {len(dish_ratings)} шт., средняя: {avg_dish_rating:.1f}\n"
-        f"⭐ Общая оценка меню: {menu_rating}/10\n"
+        f"📊 Оценка блюд ({len(dish_ratings)} шт.):\n{dishes_details}\n"
+        f"📈 Средняя оценка блюд: {avg_dish_rating:.1f}/5.0\n"
+        f"⭐ Общая оценка меню: {menu_rating}/5\n"
     )
     
     if comment and comment != '-':
         result_text += f"💬 Комментарий: {comment}\n"
     
-    result_text += f"\n📈 Данные сохранены для анализа"
+    result_text += f"\n📊 Данные сохранены для анализа"
     
-    # Редактируем последнее сообщение с результатами
-    try:
-        # Вместо edit_message_caption используем edit_message_text
-        await message.bot.edit_message_text(
-            chat_id=message.chat.id,
-            message_id=last_message_id,
-            text=result_text
-        )
-    except Exception as e:
-        # Если не удалось отредактировать, отправляем новое сообщение
-        await message.answer(result_text)
+    # Очищаем чат перед выводом статистики
+    await cleanup_chat(message, state)
     
-    # Удаляем сообщение с комментарием пользователя
-    await message.delete()
+    # Выводим финальное сообщение без клавиатуры
+    await message.answer(result_text)
     
     # Очищаем состояние
     await state.clear()
-
 # Функции для работы с данными (остаются без изменений)
 def get_user_ratings(user_id: int):
     """Получить оценки пользователя"""

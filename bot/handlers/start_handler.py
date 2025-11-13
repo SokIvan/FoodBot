@@ -1,7 +1,6 @@
 from aiogram import Router, types
 from aiogram.filters import Command
 from functions.yandex_disk import yandex_disk
-from keyboards.food_keyboard import create_dish_keyboard
 import logging
 
 router = Router()

@@ -13,3 +13,6 @@ YANDEX_DISK_FOLDER_URL = os.getenv("YANDEX_DISK_FOLDER_URL")
 
 # Telegram
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+
+#Admins
+admins = [2068329433]
