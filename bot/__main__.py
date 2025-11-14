@@ -3,7 +3,8 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, status
+from fastapi import FastAPI
+import uvicorn
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -22,7 +23,7 @@ bot = None
 dp = None
 scheduler = None
 
-async def start_bot():
+async def start_telegram_bot():
     """Запуск Telegram бота"""
     global bot, dp, scheduler
     
@@ -33,12 +34,12 @@ async def start_bot():
         )
         dp = Dispatcher()
         
-        # Настройка планировщика для самопинга
+        # Планировщик для самопинга
         scheduler = AsyncIOScheduler()
         scheduler.add_job(
-            lambda: logger.info("🔄 Bot is alive"),
+            lambda: logger.info("🔄 Bot heartbeat"),
             trigger=IntervalTrigger(minutes=10),
-            id='keep_alive'
+            id='heartbeat'
         )
         scheduler.start()
         
@@ -51,7 +52,7 @@ async def start_bot():
         logger.info("🍽️ FoodBot запущен!")
         logger.info("🔄 Keep-alive активирован (10 минут)")
         
-        # Запускаем бота в фоне
+        # Запускаем polling
         await dp.start_polling(bot)
         
     except Exception as e:
@@ -60,33 +61,36 @@ async def start_bot():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifespan manager для FastAPI"""
+    """Lifespan manager для управления жизненным циклом"""
     # Startup
-    logger.info("🚀 Starting application...")
+    logger.info("🚀 Starting FoodBot application...")
     
-    # Запускаем бота в фоне
-    bot_task = asyncio.create_task(start_bot())
+    # Запускаем бота в фоновой задаче
+    bot_task = asyncio.create_task(start_telegram_bot())
     
     yield
     
     # Shutdown
-    logger.info("🛑 Shutting down application...")
+    logger.info("🛑 Shutting down FoodBot...")
     
-    if scheduler:
+    # Останавливаем планировщик
+    if scheduler and scheduler.running:
         scheduler.shutdown()
     
+    # Закрываем сессию бота
     if bot:
         await bot.session.close()
     
+    # Отменяем задачу бота
     bot_task.cancel()
     try:
         await bot_task
     except asyncio.CancelledError:
-        pass
+        logger.info("✅ Bot task cancelled successfully")
 
 # Создаем FastAPI приложение
 app = FastAPI(
-    title="FoodBot API",
+    title="FoodBot",
     description="Telegram Bot for Food School",
     version="1.0.0",
     lifespan=lifespan
@@ -97,7 +101,8 @@ async def root():
     """Корневой эндпоинт"""
     return {
         "message": "🤖 FoodBot is running!",
-        "status": "active"
+        "status": "active",
+        "service": "food-school-bot"
     }
 
 @app.get("/health")
@@ -105,28 +110,27 @@ async def health_check():
     """Health check для Render"""
     return {
         "status": "healthy",
-        "service": "food-bot"
+        "bot": "running"
     }
 
 @app.get("/ping")
 async def ping():
-    """Простой ping"""
+    """Простой ping-эндпоинт"""
     return {"message": "pong"}
 
-@app.post("/restart")
-async def restart_bot():
-    """Перезапуск бота (для админов)"""
-    # Здесь можно добавить логику перезапуска
-    return {"message": "Restart command received"}
-
-if __name__ == "__main__":
-    import uvicorn
-    
+def main():
+    """Основная функция запуска"""
     port = int(os.environ.get("PORT", 10000))
     
+    logger.info(f"🌐 Starting server on port {port}")
+    
     uvicorn.run(
-        "main:app",
+        app,
         host="0.0.0.0",
         port=port,
-        reload=False  # На продакшене reload должен быть False
+        reload=False,  # На продакшене False!
+        access_log=True
     )
+
+if __name__ == "__main__":
+    main()
