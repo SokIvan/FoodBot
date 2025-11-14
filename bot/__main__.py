@@ -7,6 +7,7 @@ import gc
 import psutil
 import tracemalloc
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 from fastapi import FastAPI
 import uvicorn
@@ -323,6 +324,37 @@ async def force_restart():
     
     return {"message": "Restart initiated"}
 
+class IgnoreSignalsUvicornServer(uvicorn.Server):
+    """Кастомный сервер uvicorn, который игнорирует сигналы остановки"""
+    
+    def install_signal_handlers(self):
+        """Переопределяем установку обработчиков сигналов - НИЧЕГО НЕ ДЕЛАЕМ"""
+        logger.warning("🚫 UVICORN: ОТКЛЮЧЕНА обработка сигналов SIGTERM/SIGINT!")
+        pass
+
+def run_server():
+    """Запуск сервера с игнорированием сигналов"""
+    config = uvicorn.Config(
+        app,
+        host="0.0.0.0", 
+        port=int(os.environ.get("PORT", 10000)),
+        reload=False,
+        access_log=True
+    )
+    
+    server = IgnoreSignalsUvicornServer(config=config)
+    
+    try:
+        # Запускаем сервер в бесконечном цикле
+        asyncio.run(server.serve())
+    except KeyboardInterrupt:
+        logger.info("🛑 Ручное завершение (Ctrl+C)")
+    except Exception as e:
+        logger.error(f"💥 Ошибка сервера: {e}")
+        # Перезапускаем сервер через 30 секунд
+        logger.info("🔄 Перезапуск сервера через 30 секунд...")
+        os.execv(sys.executable, ['python'] + sys.argv)
+
 def main():
     """Основная функция запуска"""
     port = int(os.environ.get("PORT", 10000))
@@ -330,22 +362,12 @@ def main():
     logger.info(f"🌐 Starting server on port {port}")
     logger.warning("🚨 ВКЛЮЧЕН РЕЖИМ ИГНОРИРОВАНИЯ SIGTERM! Бот будет работать вечно!")
     logger.info("🧹 АКТИВИРОВАНА АГРЕССИВНАЯ ОЧИСТКА ПАМЯТИ!")
+    logger.warning("⚠️  UVICORN НЕ БУДЕТ РЕАГИРОВАТЬ НА SIGTERM!")
     
-    try:
-        uvicorn.run(
-            app,
-            host="0.0.0.0", 
-            port=port,
-            reload=False,
-            access_log=True
-        )
-    except Exception as e:
-        logger.error(f"💥 Ошибка сервера: {e}")
-        # Очищаем память перед перезапуском
-        cleanup_memory()
-        # Перезапускаем сервер
-        logger.info("🔄 Перезапуск сервера через 30 секунд...")
-        os.execv(sys.executable, ['python'] + sys.argv)
+    # Очищаем память перед запуском
+    cleanup_memory()
+    
+    run_server()
 
 if __name__ == "__main__":
     main()
