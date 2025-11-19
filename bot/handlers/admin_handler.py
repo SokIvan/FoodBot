@@ -1,355 +1,264 @@
-import asyncio
-from datetime import datetime
-import pandas as pd
-from io import BytesIO
-from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
+import os
+import tempfile
+from aiogram import Router, types
 from aiogram.filters import Command
-from config import admins
-from database.db_supabase import supabase_client
+from config import ADMINS
+import pandas as pd
+import io
 import logging
-from keyboards.type_keyboard import rating_emojis
+from datetime import datetime
+from database.db_supabase import supabase_client
+from aiogram.fsm.context import FSMContext
 
-logger = logging.getLogger(__name__)
-sheets_created = False
 router = Router()
+logger = logging.getLogger(__name__)
 
-# Система оценок
-rating_emojis = {
-    1: "😠",
-    2: "😕", 
-    3: "😐",
-    4: "🙂",
-    5: "😊"
-}
+def is_admin(user_id: int) -> bool:
+    """Проверяет, является ли пользователь администратором"""
+    return user_id in ADMINS
 
-# Фильтр для админов
-def admin_filter(message: Message):
-    return message.from_user.id in admins
-
-# Класс для пагинации по блюдам
-class FoodPagination:
-    def __init__(self):
-        self.current_food_index = 0
-        self.foods = []
-        self.message_id = None
-
-food_pagination = {}
-
-# 1) Показать все данные
-@router.message(Command("show"), F.from_user.id.in_(admins))
-async def show_all_data(message: Message):
-    try:
-        # Получаем все отзывы о еде
-        food_response = await supabase_client.get_all_food_reviews()
-        food_data = food_response.data
-        
-        # Получаем все отзывы о меню
-        menu_response = await supabase_client.get_all_food_menu_reviews()
-        menu_data = menu_response.data
-        
-        if not food_data and not menu_data:
-            await message.answer("Нет данных для отображения")
-            return
-        
-        # Создаем Excel файл
-        with BytesIO() as output:
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                sheets_created = False
-                
-                # Анализ блюд (таблица food)
-                if food_data:
-                    df_food = pd.DataFrame(food_data)
-                    
-                    # Преобразуем mark в число
-                    df_food['mark'] = pd.to_numeric(df_food['mark'], errors='coerce')
-                    
-                    # Средняя оценка по блюдам по дням
-                    food_daily_avg = df_food.groupby(['date', 'name'])['mark'].mean().round(2).reset_index()
-                    food_daily_avg.to_excel(writer, sheet_name='Блюда по дням', index=False)
-                    
-                    # Общая средняя оценка по блюдам
-                    food_overall_avg = df_food.groupby('name')['mark'].agg(['mean', 'count']).round(2)
-                    food_overall_avg.columns = ['Средняя оценка', 'Количество оценок']
-                    food_overall_avg.to_excel(writer, sheet_name='Общая статистика блюд')
-                    
-                    sheets_created = True
-                
-                # Анализ меню (таблица food_menu)
-                if menu_data:
-                    df_menu = pd.DataFrame(menu_data)
-                    
-                    # Преобразуем mark в число (так как в food_menu mark - text)
-                    df_menu['mark'] = pd.to_numeric(df_menu['mark'], errors='coerce')
-                    
-                    # Средняя оценка по типам меню по дням
-                    menu_daily_avg = df_menu.groupby(['date', 'type'])['mark'].mean().round(2).reset_index()
-                    menu_daily_avg.to_excel(writer, sheet_name='Меню по дням', index=False)
-                    
-                    # Общая средняя оценка по типам меню
-                    menu_overall_avg = df_menu.groupby('type')['mark'].agg(['mean', 'count']).round(2)
-                    menu_overall_avg.columns = ['Средняя оценка', 'Количество оценок']
-                    menu_overall_avg.to_excel(writer, sheet_name='Общая статистика меню')
-                    
-                    sheets_created = True
-            
-            output.seek(0)
-            # Используем BufferedInputFile для отправки документа
-            document = BufferedInputFile(output.getvalue(), filename="food_statistics.xlsx")
-            await message.answer_document(
-                document=document,
-                caption="Статистика по всем данным"
-            )
-            
-    except Exception as e:
-        error_msg = f"Ошибка при получении данных: {str(e)}"
-        # Убираем разметку для сообщений об ошибках
-        await message.answer(error_msg)
-
-# 2) Показать данные за сегодня
-@router.message(Command("show_today"), F.from_user.id.in_(admins))
-async def show_today_data(message: Message):
-    try:
-        today = datetime.now().strftime("%Y-%m-%d")
-        
-        # Получаем отзывы о еде за сегодня
-        food_response = await supabase_client.get_all_food_reviews()
-        food_today = [item for item in food_response.data if item.get('date') == today]
-        
-        # Получаем отзывы о меню за сегодня
-        menu_response = await supabase_client.get_all_food_menu_reviews()
-        menu_today = [item for item in menu_response.data if item.get('date') == today]
-        
-        if not food_today and not menu_today:
-            await message.answer("Нет данных за сегодня")
-            return
-        
-        response_text = f"📊 Статистика за {today}:\n\n"
-        
-        # Статистика по блюдам
-        if food_today:
-            response_text += "🍽️ Блюда:\n"
-            food_df = pd.DataFrame(food_today)
-            food_df['mark'] = pd.to_numeric(food_df['mark'], errors='coerce')
-            food_stats = food_df.groupby('name')['mark'].agg(['mean', 'count']).round(2)
-            
-            for food_name, stats in food_stats.iterrows():
-                response_text += f"• {food_name}: {stats['mean']}⭐ ({int(stats['count'])} оценок)\n"
-            response_text += "\n"
-        
-        # Статистика по меню
-        if menu_today:
-            response_text += "📋 Типы меню:\n"
-            menu_df = pd.DataFrame(menu_today)
-            menu_df['mark'] = pd.to_numeric(menu_df['mark'], errors='coerce')
-            menu_stats = menu_df.groupby('type')['mark'].agg(['mean', 'count']).round(2)
-            
-            for menu_type, stats in menu_stats.iterrows():
-                response_text += f"• {menu_type}: {stats['mean']}⭐ ({int(stats['count'])} оценок)\n"
-        
-        # Разбиваем длинное сообщение на части
-        if len(response_text) > 4096:
-            parts = [response_text[i:i+4096] for i in range(0, len(response_text), 4096)]
-            for part in parts:
-                await message.answer(part)
-        else:
-            await message.answer(response_text)
-        
-    except Exception as e:
-        error_msg = f"Ошибка при получении данных: {str(e)}"
-        await message.answer(error_msg)
-
-# Вспомогательные функции для показа блюд
-async def get_food_distribution(food_name):
-    """Получает распределение оценок для блюда в процентах"""
-    response = await supabase_client.get_food_reviews_by_name(food_name)
-    reviews = response.data
-    
-    if not reviews:
-        return {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
-    
-    total = len(reviews)
-    distribution = {}
-    
-    for rating in range(1, 6):
-        count = len([r for r in reviews if int(r['mark']) == rating])
-        percentage = round((count / total) * 100) if total > 0 else 0
-        distribution[rating] = percentage
-    
-    return distribution
-
-def create_food_keyboard(user_id, current_index, total_foods):
-    """Создает клавиатуру для навигации по блюдам"""
-    keyboard = []
-    
-    # Кнопки навигации
-    nav_buttons = []
-    if current_index > 0:
-        nav_buttons.append(InlineKeyboardButton(text="⬅️", callback_data=f"food_prev_{user_id}"))
-    
-    nav_buttons.append(InlineKeyboardButton(text=f"{current_index + 1}/{total_foods}", callback_data="no_action"))
-    
-    if current_index < total_foods - 1:
-        nav_buttons.append(InlineKeyboardButton(text="➡️", callback_data=f"food_next_{user_id}"))
-    
-    if nav_buttons:
-        keyboard.append(nav_buttons)
-    
-    # Кнопка выхода
-    keyboard.append([InlineKeyboardButton(text="❌ Выйти", callback_data=f"food_exit_{user_id}")])
-    
-    return InlineKeyboardMarkup(inline_keyboard=keyboard)
-
-async def show_food_page(message: Message, user_id: int, index: int):
-    """Показывает страницу с информацией о блюде"""
-    foods = food_pagination[user_id].foods
-    food_name = foods[index]
-    food_pagination[user_id].current_food_index = index
-    
-    distribution = await get_food_distribution(food_name)
-    
-    # Формируем текст с распределением оценок (без разметки)
-    text = f"🍽️ {food_name}:\n\n"
-    for rating in range(5, 0, -1):
-        emoji = rating_emojis[rating]
-        percentage = distribution[rating]
-        text += f"{emoji} - {percentage}%\n"
-    
-    # Добавляем среднюю оценку
-    total_reviews = sum([count for count in distribution.values()])
-    if total_reviews > 0:
-        avg_rating = sum(rating * count for rating, count in distribution.items()) / total_reviews
-        text += f"\n📊 Средняя оценка: {avg_rating:.2f}⭐"
-        text += f"\n👥 Всего оценок: {total_reviews}"
-    
-    keyboard = create_food_keyboard(user_id, index, len(foods))
-    
-    if food_pagination[user_id].message_id:
-        # Обновляем существующее сообщение
-        await message.bot.edit_message_text(
-            chat_id=message.chat.id,
-            message_id=food_pagination[user_id].message_id,
-            text=text,
-            reply_markup=keyboard
+@router.message(Command("stats"))
+async def get_statistics(message: types.Message, state: FSMContext):
+    """Генерация статистики в Excel для администраторов"""
+    # Проверяем, не находится ли пользователь в процессе опроса
+    current_state = await state.get_state()
+    if current_state is not None:
+        await message.answer(
+            "⏳ *Вы находитесь в процессе оценки питания!*\n\n"
+            "Завершите опрос или используйте /reset чтобы получить доступ к статистике.",
+            parse_mode="Markdown"
         )
-    else:
-        # Отправляем новое сообщение
-        sent_message = await message.answer(text, reply_markup=keyboard)
-        food_pagination[user_id].message_id = sent_message.message_id
-
-# 3) Показать блюда с инлайн кнопками
-@router.message(Command("show_food"), F.from_user.id.in_(admins))
-async def show_food_handler(message: Message):
+        return
+    
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ У вас нет доступа к этой команде.")
+        return
+    
+    if not supabase_client:
+        await message.answer("❌ База данных не доступна.")
+        return
+    
+    # Создаем временный файл
+    temp_file = None
+    
     try:
-        user_id = message.from_user.id
+        await message.answer("📊 Формирую отчет... Это может занять некоторое время.")
         
-        # Получаем список всех уникальных блюд
-        response = await supabase_client.get_all_food_reviews()
-        foods = list(set([item['name'] for item in response.data]))
+        # Получаем данные отдельными запросами
+        surveys_response = await supabase_client.get_all_surveys()
+        users_response = await supabase_client.get_all_users()
+        meal_ratings_response = await supabase_client.get_all_meal_ratings()
+        meal_comments_response = await supabase_client.get_all_meal_comments()
         
-        if not foods:
-            await message.answer("Нет данных о блюдах")
+        surveys_data = surveys_response.data
+        users_data = users_response.data
+        meal_ratings_data = meal_ratings_response.data
+        meal_comments_data = meal_comments_response.data
+        
+        if not surveys_data:
+            await message.answer("📭 Нет данных для отчета.")
             return
         
-        food_pagination[user_id] = FoodPagination()
-        food_pagination[user_id].foods = foods
-        
-        # Показываем первое блюдо
-        await show_food_page(message, user_id, 0)
-        
-    except Exception as e:
-        error_msg = f"Ошибка: {str(e)}"
-        await message.answer(error_msg)
-
-# Обработчик инлайн кнопок для навигации по блюдам
-@router.callback_query(F.data.startswith("food_"))
-async def handle_food_callback(callback: CallbackQuery):
-    try:
-        user_id = callback.from_user.id
-        data = callback.data
-        
-        if user_id not in food_pagination:
-            await callback.answer("Сессия истекла")
-            return
-        
-        if data == f"food_exit_{user_id}":
-            # Удаляем сообщение
-            await callback.message.delete()
-            # Удаляем данные пагинации
-            if user_id in food_pagination:
-                del food_pagination[user_id]
-            return
-        
-        current_index = food_pagination[user_id].current_food_index
-        total_foods = len(food_pagination[user_id].foods)
-        
-        if data == f"food_prev_{user_id}" and current_index > 0:
-            new_index = current_index - 1
-        elif data == f"food_next_{user_id}" and current_index < total_foods - 1:
-            new_index = current_index + 1
-        else:
-            await callback.answer()
-            return
-        
-        await show_food_page(callback.message, user_id, new_index)
-        await callback.answer()
-        
-    except Exception as e:
-        await callback.answer(f"Ошибка: {str(e)}")
-
-# 4) Топ 5 блюд
-@router.message(Command("rating"), F.from_user.id.in_(admins))
-async def show_top_food(message: Message):
-    try:
-        response = await supabase_client.get_all_food_reviews()
-        food_data = response.data
-        
-        if not food_data:
-            await message.answer("Нет данных о блюдах")
-            return
-        
-        # Группируем по блюдам и считаем статистику
-        food_stats = {}
-        for item in food_data:
-            food_name = item['name']
-            mark = int(item['mark'])  # Преобразуем в число
+        # Создаем временный файл
+        with tempfile.NamedTemporaryFile(mode='wb', suffix='.xlsx', delete=False) as tmp:
+            temp_file = tmp.name
             
-            if food_name not in food_stats:
-                food_stats[food_name] = {'marks': [], 'count': 0}
-            
-            food_stats[food_name]['marks'].append(mark)
-            food_stats[food_name]['count'] += 1
+            with pd.ExcelWriter(temp_file, engine='xlsxwriter') as writer:
+                workbook = writer.book
+                
+                # Лист с основными данными опросов
+                basic_data = []
+                for survey in surveys_data:
+                    user = next((u for u in users_data if u['telegram_id'] == survey['telegram_id']), {})
+                    basic_data.append({
+                        'ID анкеты': survey.get('id'),
+                        'Дата': survey.get('date'),
+                        'Telegram ID': survey.get('telegram_id'),
+                        'ФИО': user.get('full_name', 'Не указано'),
+                        'Класс': user.get('class', 'Не указан'),
+                        'Питается в школе': 'Да' if survey.get('eats_at_school') else 'Нет',
+                        'Общая оценка': survey.get('overall_satisfaction', 'Не оценено'),
+                        'Общий комментарий': survey.get('overall_comment', '')[:100] + '...' if survey.get('overall_comment') else ''
+                    })
+                
+                basic_df = pd.DataFrame(basic_data)
+                basic_df.to_excel(writer, sheet_name='Опросы', index=False)
+                
+                # Лист с пользователями
+                users_df = pd.DataFrame(users_data)
+                if not users_df.empty:
+                    users_df.to_excel(writer, sheet_name='Пользователи', index=False)
+                
+                # Лист с оценками блюд
+                if meal_ratings_data:
+                    ratings_data = []
+                    for rating in meal_ratings_data:
+                        # Находим анкету для этой оценки
+                        survey = next((s for s in surveys_data if s['id'] == rating['survey_id']), {})
+                        ratings_data.append({
+                            'ID анкеты': rating.get('survey_id'),
+                            'Дата': survey.get('date', 'Неизвестно'),
+                            'Тип блюда': rating.get('meal_type'),
+                            'Оценка': rating.get('rating')
+                        })
+                    
+                    ratings_df = pd.DataFrame(ratings_data)
+                    ratings_df.to_excel(writer, sheet_name='Оценки блюд', index=False)
+                    
+                    # Сводка по оценкам блюд
+                    if not ratings_df.empty:
+                        pivot_df = ratings_df.groupby('Тип блюда').agg({
+                            'Оценка': ['mean', 'count', 'min', 'max']
+                        }).round(2)
+                        pivot_df.to_excel(writer, sheet_name='Сводка по блюдам')
+                
+                # Лист с комментариями
+                if meal_comments_data:
+                    comments_data = []
+                    for comment in meal_comments_data:
+                        # Находим анкету для этого комментария
+                        survey = next((s for s in surveys_data if s['id'] == comment['survey_id']), {})
+                        comments_data.append({
+                            'ID анкеты': comment.get('survey_id'),
+                            'Дата': survey.get('date', 'Неизвестно'),
+                            'Тип блюда': comment.get('meal_type'),
+                            'Причина': comment.get('reason_comment', '')[:200] + '...',
+                            'Альтернатива': comment.get('alternative_comment', '')[:200] + '...'
+                        })
+                    
+                    comments_df = pd.DataFrame(comments_data)
+                    comments_df.to_excel(writer, sheet_name='Комментарии', index=False)
+                
+                # Статистика и графики
+                worksheet = workbook.add_worksheet('Статистика')
+                
+                # Базовая статистика
+                stats_data = {
+                    'Метрика': [
+                        'Всего опросов',
+                        'Всего пользователей', 
+                        'Всего оценок блюд',
+                        'Всего комментариев',
+                        'Средняя общая оценка',
+                        'Дата отчета'
+                    ],
+                    'Значение': [
+                        len(surveys_data),
+                        len(users_data),
+                        len(meal_ratings_data),
+                        len(meal_comments_data),
+                        basic_df['Общая оценка'].mean() if not basic_df.empty else 0,
+                        datetime.now().strftime('%d.%m.%Y %H:%M')
+                    ]
+                }
+                
+                stats_df = pd.DataFrame(stats_data)
+                stats_df.to_excel(writer, sheet_name='Статистика', index=False)
+                
+                # Простые графики
+                if not basic_df.empty and 'Общая оценка' in basic_df.columns:
+                    chart_sheet = workbook.add_worksheet('Графики')
+                    
+                    # Распределение общих оценок
+                    rating_counts = basic_df['Общая оценка'].value_counts().sort_index()
+                    
+                    chart = workbook.add_chart({'type': 'column'})
+                    chart.add_series({
+                        'name': 'Количество оценок',
+                        'categories': f'=Опросы!$G$2:$G${len(rating_counts)+1}',
+                        'values': f'=Опросы!$G$2:$G${len(rating_counts)+1}',
+                    })
+                    chart.set_title({'name': 'Распределение общих оценок'})
+                    chart_sheet.insert_chart('A1', chart)
         
-        # Вычисляем средние оценки
-        top_foods = []
-        for food_name, stats in food_stats.items():
-            avg_mark = sum(stats['marks']) / len(stats['marks'])
-            top_foods.append({
-                'name': food_name,
-                'avg_mark': round(avg_mark, 2),
-                'count': stats['count']
-            })
+        # Читаем файл для отправки
+        with open(temp_file, 'rb') as file:
+            file_data = file.read()
         
-        # Сортируем по убыванию средней оценки
-        top_foods.sort(key=lambda x: x['avg_mark'], reverse=True)
-        top_5 = top_foods[:5]
-        
-        # Формируем ответ (без разметки)
-        response_text = "🏆 Топ-5 блюд по средней оценке:\n\n"
-        
-        for i, food in enumerate(top_5, 1):
-            stars = "⭐" * int(food['avg_mark'])
-            response_text += f"{i}. {food['name']}\n"
-            response_text += f"   Оценка: {food['avg_mark']} {stars}\n"
-            response_text += f"   Количество оценок: {food['count']}\n\n"
-        
-        await message.answer(response_text)
+        # Отправляем файл
+        await message.answer_document(
+            document=types.BufferedInputFile(
+                file_data,
+                filename=f"school_food_stats_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+            ),
+            caption="📊 *Статистика опросов школьного питания*\n\n"
+                   "Файл содержит:\n"
+                   "• Все опросы\n" 
+                   "• Пользователей\n"
+                   "• Оценки блюд\n"
+                   "• Комментарии\n"
+                   "• Сводные таблицы\n"
+                   "• Статистику и графики",
+            parse_mode="Markdown"
+        )
         
     except Exception as e:
-        error_msg = f"Ошибка при получении рейтинга: {str(e)}"
-        await message.answer(error_msg)
+        logger.error(f"❌ Ошибка генерации статистики: {e}")
+        await message.answer("❌ Произошла ошибка при генерации отчета.")
+    
+    finally:
+        # УДАЛЯЕМ временный файл после отправки
+        if temp_file and os.path.exists(temp_file):
+            try:
+                os.unlink(temp_file)
+                logger.info(f"🧹 Удален временный файл: {temp_file}")
+            except Exception as e:
+                logger.warning(f"Не удалось удалить временный файл {temp_file}: {e}")
 
-# Обработчик для кнопок без действия
-@router.callback_query(F.data == "no_action")
-async def handle_no_action(callback: CallbackQuery):
-    await callback.answer()
+@router.message(Command("daily_stats"))
+async def get_daily_stats(message: types.Message, state: FSMContext):
+    """Статистика за сегодня"""
+    # Проверяем, не находится ли пользователь в процессе опроса
+    current_state = await state.get_state()
+    if current_state is not None:
+        await message.answer(
+            "⏳ *Вы находитесь в процессе оценки питания!*\n\n"
+            "Завершите опрос или используйте /reset чтобы получить доступ к статистике.",
+            parse_mode="Markdown"
+        )
+        return
+    
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ У вас нет доступа к этой команде.")
+        return
+    
+    if not supabase_client:
+        await message.answer("❌ База данных не доступна.")
+        return
+    
+    try:
+        today = datetime.now().date().isoformat()
+        today_stats = await supabase_client.get_daily_stats(today)
+        stats_data = today_stats.data
+        
+        if not stats_data:
+            await message.answer("📭 На сегодня нет данных.")
+            return
+        
+        # Получаем дополнительные данные для расчетов
+        all_ratings = await supabase_client.get_all_meal_ratings()
+        today_ratings = [r for r in all_ratings.data if any(s['id'] == r['survey_id'] for s in stats_data)]
+        
+        total_surveys = len(stats_data)
+        
+        # Средняя общая оценка
+        overall_ratings = [s.get('overall_satisfaction', 0) for s in stats_data if s.get('overall_satisfaction')]
+        avg_overall = sum(overall_ratings) / len(overall_ratings) if overall_ratings else 0
+        
+        # Средняя оценка блюд
+        avg_meal = sum(r.get('rating', 0) for r in today_ratings) / len(today_ratings) if today_ratings else 0
+        
+        stats_text = (
+            f"📊 *Статистика за сегодня* ({datetime.now().strftime('%d.%m.%Y')})\n\n"
+            f"• Всего опросов: {total_surveys}\n"
+            f"• Средняя общая оценка: {avg_overall:.1f}/5\n"
+            f"• Средняя оценка блюд: {avg_meal:.1f}/5\n"
+            f"• Оценено блюд: {len(today_ratings)}\n\n"
+            f"Для полного отчета используйте /stats"
+        )
+        
+        await message.answer(stats_text, parse_mode="Markdown")
+        
+    except Exception as e:
+        logger.error(f"Ошибка получения дневной статистики: {e}")
+        await message.answer("❌ Ошибка получения статистики.")
