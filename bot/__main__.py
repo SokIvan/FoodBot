@@ -5,7 +5,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
 from config import TELEGRAM_TOKEN
-from handlers import start_handler, mark_handler, admin_handler
+from handlers import start_handler, mark_handler, admin_handler,special_mark_handler 
 from callbacks import type_callback
 
 logging.basicConfig(level=logging.INFO)
@@ -22,8 +22,10 @@ async def main():
     # Регистрация роутеров
     dp.include_router(start_handler.router)
     dp.include_router(mark_handler.router)
+    dp.include_router(special_mark_handler.router)
     dp.include_router(type_callback.router)
     dp.include_router(admin_handler.router)
+
     
     logger.info("🍽️ FoodBot запущен!")
     

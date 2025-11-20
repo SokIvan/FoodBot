@@ -48,9 +48,26 @@ class SupabaseClient:
             raise
     
     # Survey methods
+    # db_supabase.py - исправляем метод create_survey
     async def create_survey(self, survey_data):
         """Создает новую анкету"""
         try:
+            # Добавляем дату создания если не указана
+            if 'date' not in survey_data:
+                from datetime import datetime
+                survey_data['date'] = datetime.now().date().isoformat()
+            
+            # Убедимся, что все необходимые поля есть
+            default_fields = {
+                'no_school_reason': '',
+                'overall_comment': '',
+                'overall_satisfaction': None
+            }
+            
+            for field, default_value in default_fields.items():
+                if field not in survey_data:
+                    survey_data[field] = default_value
+                    
             return self.client.table("surveys").insert(survey_data).execute()
         except Exception as e:
             logger.error(f"Ошибка создания анкеты: {e}")
@@ -212,4 +229,65 @@ class SupabaseClient:
         except Exception as e:
             logger.error(f"❌ Error getting all meal comments: {e}")
             raise
+    
+    async def create_survey(self, survey_data):
+        """Создает новую анкету"""
+        try:
+            # Добавляем дату создания если не указана
+            if 'date' not in survey_data:
+                from datetime import datetime
+                survey_data['date'] = datetime.now().date().isoformat()
+            
+            # Убедимся, что все необходимые поля есть
+            default_fields = {
+                'no_school_reason': '',
+                'overall_comment': '',
+                'overall_satisfaction': None
+            }
+            
+            for field, default_value in default_fields.items():
+                if field not in survey_data:
+                    survey_data[field] = default_value
+                    
+            return self.client.table("surveys").insert(survey_data).execute()
+        except Exception as e:
+            logger.error(f"Ошибка создания анкеты: {e}")
+            raise
+    
+    async def get_user_survey_for_date(self, telegram_id, date):
+        """Получает анкету пользователя для конкретной даты"""
+        try:
+            return self.client.table("surveys").select("*").eq("telegram_id", telegram_id).eq("date", date).execute()
+        except Exception as e:
+            logger.error(f"❌ Error getting user survey for date: {e}")
+            raise
+    
+    async def update_survey_for_date(self, telegram_id, date, survey_data):
+        """Обновляет анкету для конкретной даты"""
+        try:
+            return self.client.table("surveys").update(survey_data).eq("telegram_id", telegram_id).eq("date", date).execute()
+        except Exception as e:
+            logger.error(f"❌ Error updating survey for date: {e}")
+            raise
+    
+    async def create_or_update_survey_for_date(self, telegram_id, date, survey_data):
+        """Создает или обновляет анкету для конкретной даты"""
+        try:
+            # Проверяем существующую анкету
+            existing_survey = await self.get_user_survey_for_date(telegram_id, date)
+            
+            if existing_survey.data:
+                # Обновляем существующую
+                survey_id = existing_survey.data[0]['id']
+                return self.client.table("surveys").update(survey_data).eq("id", survey_id).execute()
+            else:
+                # Создаем новую
+                survey_data['telegram_id'] = telegram_id
+                survey_data['date'] = date
+                return await self.create_survey(survey_data)
+                
+        except Exception as e:
+            logger.error(f"❌ Error creating/updating survey for date: {e}")
+            raise
+
 supabase_client = SupabaseClient()

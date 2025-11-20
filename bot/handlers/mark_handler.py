@@ -15,6 +15,7 @@ class SurveyStates(StatesGroup):
     waiting_for_meal_rating = State()
     waiting_for_meal_comment = State()
 
+# mark_handler.py - обновляем первый вопрос
 @router.message(Command("mark"))
 async def start_survey(message: types.Message, state: FSMContext):
     """Начало опроса"""
@@ -38,7 +39,7 @@ async def start_survey(message: types.Message, state: FSMContext):
     
     await message.answer(
         "🏫 *Первый вопрос:*\n\n"
-        "Вы питаетесь в столовой школы №64?",
+        "Вы питаетесь в школьной столовой?",  # Измененный текст
         reply_markup=get_school_confirmation_keyboard(),
         parse_mode="Markdown"
     )

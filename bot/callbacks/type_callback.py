@@ -17,8 +17,10 @@ from keyboards.survey_keyboards import (
 router = Router()
 logger = logging.getLogger(__name__)
 
+# type_callback.py - обновляем класс состояний
 class SurveyStates(StatesGroup):
     waiting_for_school_confirmation = State()
+    waiting_for_no_school_reason = State()  # Новое состояние
     waiting_for_user_info = State()
     waiting_for_overall_satisfaction = State()
     waiting_for_overall_comment = State()
@@ -32,6 +34,7 @@ current_user_id = None
 # Хранилище для ID сообщений которые нужно удалять
 message_ids_to_delete = {}
 
+# type_callback.py - добавляем обработку отказа для обычного маршрута
 @router.callback_query(F.data.startswith("school_"))
 async def process_school_confirmation(callback: CallbackQuery, state: FSMContext):
     """Обработка подтверждения питания в школе"""
@@ -47,13 +50,18 @@ async def process_school_confirmation(callback: CallbackQuery, state: FSMContext
     await callback.message.delete()
     
     if not eats_at_school:
-        await callback.message.answer(
-            "❌ *К сожалению, этот бот предназначен только для учащихся, "
-            "которые питаются в столовой школы №64.*\n\n"
-            "Если это ошибка, начните заново с команды /mark",
+        # Если не питается в школе - запрашиваем причину
+        reason_message = await callback.message.answer(
+            "💬 *Почему вы не питаетесь в школьной столовой?*\n\n"
+            "Напишите причину:\n"
+            "• Не нравится еда?\n" 
+            "• Приносите еду с собой?\n"
+            "• Другая причина?",
+            reply_markup=get_comment_skip_keyboard("no_school_reason"),
             parse_mode="Markdown"
         )
-        await state.clear()
+        await state.update_data(no_school_reason_message_id=reason_message.message_id)
+        await state.set_state(SurveyStates.waiting_for_no_school_reason)
         return
     
     # Сохраняем в состоянии
@@ -71,6 +79,118 @@ async def process_school_confirmation(callback: CallbackQuery, state: FSMContext
     await state.update_data(user_info_message_id=new_message.message_id)
     await state.set_state(SurveyStates.waiting_for_user_info)
     await callback.answer()
+
+@router.callback_query(F.data == "skip_comment_no_school_reason")
+async def skip_no_school_reason_regular(callback: CallbackQuery, state: FSMContext):
+    """Пропуск причины непосещения столовой для обычного маршрута"""
+    global current_user_id
+    
+    # Обновляем user_id
+    current_user_id = callback.from_user.id
+    
+    await callback.answer("Причина пропущена")
+    await callback.message.delete()
+    
+    # Сохраняем пользователя в БД даже если он не питается в столовой
+    try:
+        user_data = {
+            "telegram_id": current_user_id,
+            "full_name": "",
+            "class": "",
+            "has_profile": False  # Отмечаем что профиль не заполнен
+        }
+        
+        if not await supabase_client.user_exists(current_user_id):
+            await supabase_client.create_user(user_data)
+            logger.info(f"✅ Создан пользователь (не питается в столовой): {current_user_id}")
+        
+        # Создаем анкету с пустой причиной
+        survey_data = {
+            "telegram_id": current_user_id,
+            "eats_at_school": False,
+            "no_school_reason": "",
+            "overall_satisfaction": None,
+            "overall_comment": ""
+        }
+        
+        await supabase_client.create_survey(survey_data)
+        logger.info(f"✅ Создана анкета для непосещающего столовую: {current_user_id}")
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка сохранения пользователя не посещающего столовую: {e}")
+    
+    await callback.message.answer(
+        "❌ *Оценка питания отменена*\n\n"
+        "Этот бот предназначен только для учащихся, которые питаются в школьной столовой.",
+        parse_mode="Markdown"
+    )
+    await state.clear()
+
+
+@router.message(SurveyStates.waiting_for_no_school_reason)
+async def process_no_school_reason_regular(message: Message, state: FSMContext):
+    """Обработка причины непосещения столовой для обычного маршрута"""
+    global current_user_id
+    
+    # Обновляем user_id
+    current_user_id = message.from_user.id
+    
+    reason = message.text.strip()
+    
+    # Удаляем сообщение с комментарием пользователя
+    await message.delete()
+    
+    # Удаляем сообщение с запросом причины
+    data = await state.get_data()
+    if 'no_school_reason_message_id' in data:
+        try:
+            await message.bot.delete_message(
+                chat_id=message.chat.id,
+                message_id=data['no_school_reason_message_id']
+            )
+        except Exception as e:
+            logger.warning(f"Не удалось удалить сообщение: {e}")
+    
+    # Сохраняем причину
+    await state.update_data(no_school_reason=reason)
+    
+    await message.answer(
+        "📝 *Ваш отзыв сохранен*\n\n"
+        f"*Причина непосещения столовой:* {reason}\n\n"
+        "Спасибо за обратную связь! Эта информация поможет улучшить школьное питание.",
+        parse_mode="Markdown"
+    )
+    
+    # Сохраняем в БД
+    try:
+        # Сохраняем пользователя даже если он не питается в столовой
+        user_data = {
+            "telegram_id": current_user_id,
+            "full_name": "",
+            "class": "",
+            "has_profile": False  # Отмечаем что профиль не заполнен
+        }
+        
+        if not await supabase_client.user_exists(current_user_id):
+            await supabase_client.create_user(user_data)
+            logger.info(f"✅ Создан пользователь (не питается в столовой): {current_user_id}")
+        
+        # Создаем анкету с причиной
+        survey_data = {
+            "telegram_id": current_user_id,
+            "eats_at_school": False,
+            "no_school_reason": reason,
+            "overall_satisfaction": None,
+            "overall_comment": ""
+        }
+        
+        await supabase_client.create_survey(survey_data)
+        logger.info(f"✅ Создана анкета с причиной непосещения для {current_user_id}")
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка сохранения анкеты с причиной: {e}")
+    
+    await state.clear()
 
 @router.message(SurveyStates.waiting_for_user_info)
 async def process_user_info(message: Message, state: FSMContext):
@@ -237,6 +357,7 @@ async def start_meal_rating(message: Message, state: FSMContext):
     # Показываем первое блюдо
     await show_next_meal(message, state)
 
+# type_callback.py - обновляем функцию show_next_meal
 async def show_next_meal(message: Message, state: FSMContext):
     """Показывает следующее блюдо для оценки"""
     data = await state.get_data()
@@ -250,16 +371,41 @@ async def show_next_meal(message: Message, state: FSMContext):
     
     current_meal = meals[current_index]
     
-    caption = (f"🍽 *{current_meal['name']}*\n\n"
-               f"Оцените это блюдо:")
+    # КРАСИВЫЕ ТЕКСТЫ в зависимости от наличия фото
+    if current_meal.get('has_image', True) and current_meal.get('download_url'):
+        caption = (f"🍽 *{current_meal['name']}*\n\n"
+                   f"Оцените это блюдо:")
+    else:
+        meal_type = current_meal['type']
+        if meal_type == "первое":
+            caption = "🍵 *Первое блюдо*\n\nКак вы оцените сегодняшний суп?"
+        elif meal_type == "второе":
+            caption = "🍛 *Второе блюдо*\n\nНасколько вам понравилось основное блюдо?"
+        elif meal_type == "напиток":
+            caption = "🥤 *Напиток*\n\nКак вам сегодняшний напиток?"
+        else:
+            caption = f"🍽 *{current_meal['name']}*\n\nКак вы оцените это блюдо?"
+    
+    # Проверяем есть ли изображение у блюда
+    has_image = current_meal.get('has_image', True) and current_meal.get('download_url')
     
     try:
-        meal_message = await message.answer_photo(
-            photo=current_meal['download_url'],
-            caption=caption,
-            reply_markup=get_emoji_rating_keyboard("meal"),
-            parse_mode="Markdown"
-        )
+        if has_image:
+            # Отправляем с фото
+            meal_message = await message.answer_photo(
+                photo=current_meal['download_url'],
+                caption=caption,
+                reply_markup=get_emoji_rating_keyboard("meal"),
+                parse_mode="Markdown"
+            )
+        else:
+            # Отправляем только текст
+            meal_message = await message.answer(
+                caption,
+                reply_markup=get_emoji_rating_keyboard("meal"),
+                parse_mode="Markdown"
+            )
+        
         await state.update_data(current_meal_message_id=meal_message.message_id)
     except Exception as e:
         # Если не удалось отправить фото, отправляем текстом
